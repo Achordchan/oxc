@@ -133,26 +133,6 @@ struct TrackedSymbol {
     has_captured_read: bool,
 }
 
-#[derive(Clone, Copy)]
-enum AssignmentTarget {
-    Simple(NodeId),
-    Destructuring(NodeId),
-}
-
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct DestructuringOperationPosition(SmallVec<[u32; 4]>);
-
-type PendingDestructuringOperations<'a> =
-    (NodeId, SmallVec<[(&'a Reference, DestructuringOperationPosition); 2]>);
-
-impl AssignmentTarget {
-    fn node_id(self) -> NodeId {
-        match self {
-            Self::Simple(node_id) | Self::Destructuring(node_id) => node_id,
-        }
-    }
-}
-
 impl Rule for NoUselessAssignment {
     fn run_once(&self, ctx: &LintContext) {
         let allocator = Allocator::default();
@@ -203,16 +183,16 @@ impl Rule for NoUselessAssignment {
             }
 
             // Process references inline with reordering for assignment expressions like a = a + 1
-            let references = ctx.symbol_references(symbol_id);
+            let ambiguous_destructuring_assignments =
+                Self::ambiguous_destructuring_assignments(ctx, symbol_id);
             let mut pending_assignment_lhs: Option<(&Reference, bool)> = None;
-            let mut pending_destructuring_operations: Option<PendingDestructuringOperations<'_>> =
-                None;
+            let mut last_conservative_assignment = None;
 
-            for reference in references {
+            for reference in ctx.symbol_references(symbol_id) {
+                let mut is_within_pending_assignment = false;
                 if let Some((lhs, previous_value_read)) = pending_assignment_lhs
-                    && let Some(assignment_target) = Self::get_assignment_target(ctx, lhs)
+                    && let Some(assign_node_id) = Self::get_assignment_node(ctx, lhs)
                 {
-                    let assign_node_id = assignment_target.node_id();
                     let assign_node = ctx.nodes().get_node(assign_node_id);
                     if assign_node
                         .span()
@@ -221,152 +201,105 @@ impl Rule for NoUselessAssignment {
                         if reference.is_read() && !reference.is_write() {
                             pending_assignment_lhs = Some((lhs, true));
                         }
+                        is_within_pending_assignment = true;
+                    } else {
                         Self::process_reference_deferred(
                             ctx,
                             graph,
                             &mut cfg_ops,
-                            reference,
+                            lhs,
                             compact_idx,
                             var_decl,
                             decl_node,
                             &mut tracked_symbols[compact_idx as usize],
-                            false,
+                            previous_value_read,
                         );
-                        continue;
+                        pending_assignment_lhs = None;
                     }
+                }
+
+                let reference_span = ctx.nodes().get_node(reference.node_id()).span();
+                if let Some(assignment_node_id) =
+                    ambiguous_destructuring_assignments.iter().copied().find(|assignment_node_id| {
+                        ctx.nodes()
+                            .get_node(*assignment_node_id)
+                            .span()
+                            .contains_inclusive(reference_span)
+                    })
+                {
+                    // The exact execution order is unknown, so keep the previous value live and
+                    // do not report any writes to this symbol within the assignment.
+                    if last_conservative_assignment != Some(assignment_node_id) {
+                        Self::push_op(
+                            ctx,
+                            graph,
+                            &mut cfg_ops,
+                            assignment_node_id,
+                            Operation::Read,
+                            compact_idx,
+                        );
+                        let tracked_symbol = &mut tracked_symbols[compact_idx as usize];
+                        tracked_symbol.is_used = true;
+                        last_conservative_assignment = Some(assignment_node_id);
+                    }
+                    if is_within_pending_assignment && let Some((lhs, _)) = pending_assignment_lhs {
+                        pending_assignment_lhs = Some((lhs, true));
+                    }
+                    if reference.is_read()
+                        && !Self::has_same_parent_variable_scope(
+                            ctx,
+                            tracked_symbols[compact_idx as usize].scope_id,
+                            ctx.nodes().get_node(reference.node_id()).scope_id(),
+                        )
+                    {
+                        tracked_symbols[compact_idx as usize].has_captured_read = true;
+                    }
+                    continue;
+                }
+
+                if is_within_pending_assignment {
                     Self::process_reference_deferred(
                         ctx,
                         graph,
                         &mut cfg_ops,
-                        lhs,
+                        reference,
                         compact_idx,
                         var_decl,
                         decl_node,
                         &mut tracked_symbols[compact_idx as usize],
-                        previous_value_read,
+                        false,
                     );
-                    pending_assignment_lhs = None;
-                }
-
-                if pending_destructuring_operations.is_none()
-                    && let Some(assignment_node_id) =
-                        Self::get_enclosing_destructuring_assignment_target(ctx, reference)
-                {
-                    let mut operations = SmallVec::new();
-                    Self::insert_destructuring_operation(
-                        &mut operations,
-                        reference,
-                        Self::destructuring_target_operation_position(
-                            ctx,
-                            reference,
-                            assignment_node_id,
-                        ),
-                    );
-                    pending_destructuring_operations = Some((assignment_node_id, operations));
                     continue;
                 }
 
-                if let Some((assignment_node_id, _)) = pending_destructuring_operations.as_ref() {
-                    let assignment_node_id = *assignment_node_id;
-                    let reference_node = ctx.nodes().get_node(reference.node_id());
-                    if ctx
-                        .nodes()
-                        .get_node(assignment_node_id)
-                        .span()
-                        .contains_inclusive(reference_node.span())
-                    {
-                        let (_, operations) = pending_destructuring_operations
-                            .as_mut()
-                            .expect("destructuring operations should be pending");
-                        Self::insert_destructuring_operation(
-                            operations,
-                            reference,
-                            Self::destructuring_target_operation_position(
-                                ctx,
-                                reference,
-                                assignment_node_id,
-                            ),
+                if reference.is_write() && Self::get_assignment_node(ctx, reference).is_some() {
+                    if let Some((prev, previous_value_read)) = pending_assignment_lhs.take() {
+                        Self::process_reference_deferred(
+                            ctx,
+                            graph,
+                            &mut cfg_ops,
+                            prev,
+                            compact_idx,
+                            var_decl,
+                            decl_node,
+                            &mut tracked_symbols[compact_idx as usize],
+                            previous_value_read,
                         );
-                        continue;
                     }
-                    let (_, mut operations) = pending_destructuring_operations
-                        .take()
-                        .expect("destructuring operations should be pending");
-                    Self::flush_destructuring_operations(
+                    pending_assignment_lhs = Some((reference, reference.is_read()));
+                } else {
+                    Self::process_reference_deferred(
                         ctx,
                         graph,
                         &mut cfg_ops,
-                        &mut operations,
+                        reference,
                         compact_idx,
                         var_decl,
                         decl_node,
                         &mut tracked_symbols[compact_idx as usize],
+                        false,
                     );
                 }
-
-                if reference.is_write() {
-                    match Self::get_assignment_target(ctx, reference) {
-                        Some(AssignmentTarget::Destructuring(assignment_node_id)) => {
-                            let mut operations = SmallVec::new();
-                            Self::insert_destructuring_operation(
-                                &mut operations,
-                                reference,
-                                Self::destructuring_target_operation_position(
-                                    ctx,
-                                    reference,
-                                    assignment_node_id,
-                                ),
-                            );
-                            pending_destructuring_operations =
-                                Some((assignment_node_id, operations));
-                            continue;
-                        }
-                        Some(AssignmentTarget::Simple(_)) => {
-                            if let Some((prev, previous_value_read)) = pending_assignment_lhs.take()
-                            {
-                                Self::process_reference_deferred(
-                                    ctx,
-                                    graph,
-                                    &mut cfg_ops,
-                                    prev,
-                                    compact_idx,
-                                    var_decl,
-                                    decl_node,
-                                    &mut tracked_symbols[compact_idx as usize],
-                                    previous_value_read,
-                                );
-                            }
-                            pending_assignment_lhs = Some((reference, reference.is_read()));
-                            continue;
-                        }
-                        None => {}
-                    }
-                }
-
-                Self::process_reference_deferred(
-                    ctx,
-                    graph,
-                    &mut cfg_ops,
-                    reference,
-                    compact_idx,
-                    var_decl,
-                    decl_node,
-                    &mut tracked_symbols[compact_idx as usize],
-                    false,
-                );
-            }
-
-            if let Some((_, mut operations)) = pending_destructuring_operations {
-                Self::flush_destructuring_operations(
-                    ctx,
-                    graph,
-                    &mut cfg_ops,
-                    &mut operations,
-                    compact_idx,
-                    var_decl,
-                    decl_node,
-                    &mut tracked_symbols[compact_idx as usize],
-                );
             }
 
             if let Some((lhs, previous_value_read)) = pending_assignment_lhs {
@@ -654,7 +587,7 @@ impl NoUselessAssignment {
         last
     }
 
-    fn get_assignment_target(ctx: &LintContext, reference: &Reference) -> Option<AssignmentTarget> {
+    fn get_assignment_node(ctx: &LintContext, reference: &Reference) -> Option<NodeId> {
         let node = ctx.nodes().get_node(reference.node_id());
         if !matches!(node.kind(), AstKind::IdentifierReference(_)) {
             return None;
@@ -662,22 +595,15 @@ impl NoUselessAssignment {
 
         for ancestor in ctx.nodes().ancestors(node.id()) {
             let AstKind::AssignmentExpression(assignment) = ancestor.kind() else { continue };
-            if !assignment.left.span().contains_inclusive(node.span()) {
-                continue;
+            if assignment.left.span().contains_inclusive(node.span()) {
+                return Some(ancestor.id());
             }
-            return Some(match &assignment.left {
-                AstAssignmentTarget::ArrayAssignmentTarget(_)
-                | AstAssignmentTarget::ObjectAssignmentTarget(_) => {
-                    AssignmentTarget::Destructuring(ancestor.id())
-                }
-                _ => AssignmentTarget::Simple(ancestor.id()),
-            });
         }
 
         None
     }
 
-    fn get_enclosing_destructuring_assignment_target(
+    fn get_enclosing_destructuring_assignment(
         ctx: &LintContext,
         reference: &Reference,
     ) -> Option<NodeId> {
@@ -689,124 +615,74 @@ impl NoUselessAssignment {
         let mut enclosing = None;
         for ancestor in ctx.nodes().ancestors(node.id()) {
             let AstKind::AssignmentExpression(assignment) = ancestor.kind() else { continue };
-            if assignment.left.span().contains_inclusive(node.span())
-                && matches!(
-                    &assignment.left,
-                    AstAssignmentTarget::ArrayAssignmentTarget(_)
-                        | AstAssignmentTarget::ObjectAssignmentTarget(_)
-                )
-            {
+            if matches!(
+                &assignment.left,
+                AstAssignmentTarget::ArrayAssignmentTarget(_)
+                    | AstAssignmentTarget::ObjectAssignmentTarget(_)
+            ) {
                 enclosing = Some(ancestor.id());
             }
         }
         enclosing
     }
 
-    fn destructuring_target_write_position(ctx: &LintContext, reference: &Reference) -> u32 {
-        let node = ctx.nodes().get_node(reference.node_id());
-        for ancestor in ctx.nodes().ancestors(node.id()) {
-            match ancestor.kind() {
-                AstKind::AssignmentTargetWithDefault(target) => return target.init.span().end,
-                AstKind::AssignmentTargetPropertyIdentifier(target) => {
-                    if let Some(init) = &target.init {
-                        return init.span().end;
+    fn ambiguous_destructuring_assignments(
+        ctx: &LintContext,
+        symbol_id: SymbolId,
+    ) -> SmallVec<[NodeId; 1]> {
+        let mut assignments = SmallVec::<[NodeId; 1]>::new();
+        for reference in ctx.symbol_references(symbol_id).filter(|reference| reference.is_write()) {
+            if let Some(assignment_node_id) =
+                Self::get_enclosing_destructuring_assignment(ctx, reference)
+                && !assignments.contains(&assignment_node_id)
+            {
+                assignments.push(assignment_node_id);
+            }
+        }
+
+        assignments.retain(|assignment_node_id| {
+            let AstKind::AssignmentExpression(assignment) =
+                ctx.nodes().get_node(*assignment_node_id).kind()
+            else {
+                unreachable!("destructuring assignment should be an assignment expression");
+            };
+            let mut direct_target = None;
+
+            // A single direct target whose other references are read-only and in the RHS can be
+            // modeled exactly by deferring the target write. Anything else is conservative.
+            for reference in ctx.symbol_references(symbol_id) {
+                let reference_node = ctx.nodes().get_node(reference.node_id());
+                if !assignment.span.contains_inclusive(reference_node.span()) {
+                    continue;
+                }
+
+                if reference.is_write()
+                    && Self::get_assignment_node(ctx, reference) == Some(*assignment_node_id)
+                {
+                    if direct_target.replace(reference.node_id()).is_some() {
+                        return true;
                     }
+                    continue;
                 }
-                AstKind::AssignmentExpression(_) => break,
-                _ => {}
-            }
-        }
-        node.span().start
-    }
 
-    fn destructuring_target_operation_position(
-        ctx: &LintContext,
-        reference: &Reference,
-        assignment_node_id: NodeId,
-    ) -> DestructuringOperationPosition {
-        let node = ctx.nodes().get_node(reference.node_id());
-        // Each nested assignment contributes its source position and a phase:
-        // RHS first, then target. This preserves sibling source order while
-        // recursively modeling assignment evaluation order.
-        let mut assignment_path = SmallVec::<[(NodeId, bool); 4]>::new();
-        for ancestor in ctx.nodes().ancestors(node.id()) {
-            let AstKind::AssignmentExpression(assignment) = ancestor.kind() else { continue };
-            let is_target = assignment.left.span().contains_inclusive(node.span());
-            if !is_target && !assignment.right.span().contains_inclusive(node.span()) {
-                continue;
-            }
-            assignment_path.push((ancestor.id(), is_target));
-            if ancestor.id() == assignment_node_id {
-                break;
-            }
-        }
-
-        let mut position = SmallVec::new();
-        for (node_id, is_target) in assignment_path.iter().rev() {
-            if *node_id != assignment_node_id {
-                position.push(ctx.nodes().get_node(*node_id).span().start);
-            }
-            position.push(u32::from(*is_target));
-        }
-
-        let reference_position = if reference.is_write() {
-            match Self::get_assignment_target(ctx, reference) {
-                Some(AssignmentTarget::Destructuring(_)) => {
-                    Self::destructuring_target_write_position(ctx, reference)
+                if !reference.is_read()
+                    || reference.is_write()
+                    || !assignment.right.span().contains_inclusive(reference_node.span())
+                {
+                    return true;
                 }
-                Some(AssignmentTarget::Simple(node_id)) => Self::assignment_right_end(ctx, node_id),
-                _ => node.span().start,
             }
-        } else {
-            node.span().start
-        };
-        position.push(reference_position);
-        DestructuringOperationPosition(position)
-    }
 
-    fn assignment_right_end(ctx: &LintContext, assignment_node_id: NodeId) -> u32 {
-        let AstKind::AssignmentExpression(assignment) =
-            ctx.nodes().get_node(assignment_node_id).kind()
-        else {
-            unreachable!("assignment target should be an assignment expression");
-        };
-        assignment.right.span().end
-    }
+            let Some(target_node_id) = direct_target else { return true };
+            let target_cfg_id = ctx.nodes().cfg_id(target_node_id);
+            ctx.symbol_references(symbol_id).any(|reference| {
+                let reference_node = ctx.nodes().get_node(reference.node_id());
+                assignment.right.span().contains_inclusive(reference_node.span())
+                    && ctx.nodes().cfg_id(reference.node_id()) != target_cfg_id
+            })
+        });
 
-    fn insert_destructuring_operation<'a>(
-        operations: &mut SmallVec<[(&'a Reference, DestructuringOperationPosition); 2]>,
-        reference: &'a Reference,
-        position: DestructuringOperationPosition,
-    ) {
-        let index =
-            operations.partition_point(|(_, operation_position)| operation_position <= &position);
-        operations.insert(index, (reference, position));
-    }
-
-    #[expect(clippy::too_many_arguments)]
-    fn flush_destructuring_operations(
-        ctx: &LintContext,
-        graph: &Graph,
-        cfg_ops: &mut CfgOps,
-        operations: &mut SmallVec<[(&Reference, DestructuringOperationPosition); 2]>,
-        compact_idx: u32,
-        var_decl: &oxc_ast::ast::VariableDeclarator,
-        decl_node: &oxc_semantic::AstNode,
-        tracked_symbol: &mut TrackedSymbol,
-    ) {
-        for (reference, _) in std::mem::take(operations) {
-            Self::process_reference_deferred(
-                ctx,
-                graph,
-                cfg_ops,
-                reference,
-                compact_idx,
-                var_decl,
-                decl_node,
-                tracked_symbol,
-                false,
-            );
-        }
+        assignments
     }
 
     fn is_in_try_block(graph: &Graph, block_node_id: BlockNodeId) -> bool {
@@ -1508,6 +1384,46 @@ function useResource(unsafe: (resource: { readonly release: () => void }) => voi
 
   return collected;
 }",
+        "let x = 'used';
+                    [x = x] = [];",
+        "let x = 0;
+                    [x, x] = [1, 2];
+                    console.log(x);",
+        "let x = 0, y;
+                    [x, y = x] = [1];
+                    console.log(y);",
+        "let x = 0;
+                    [x = x] = (x = 1, []);
+                    console.log(x);",
+        "let x = 0;
+                    ({ [x]: x } = (x = 1, {}));
+                    console.log(x);",
+        "let x = 0, y;
+                    ({ [key(x)]: y } = (x = 1, {}));
+                    console.log(y);",
+        "let x = 0, y;
+                    [x, y = (x = x + 1)] = [1];
+                    console.log(x);",
+        "let x = 0;
+                    [x] = (x = x + 1, [2]);
+                    console.log(x);",
+        "let x = 0, y, z;
+                    [y = (z = x)] = (x = 1, []);
+                    console.log(y);",
+        "let x = 0, y;
+                    [x, y = ([x] = [x + 1])] = [1];
+                    console.log(x);",
+        "let x = 0, y;
+                    [y = ([x] = [x])] = (x = 1, []);
+                    console.log(x);",
+        "let x = 0, y, z;
+                    ({ [({ [x]: z } = (x = 1, {}), 0)]: y } = {});
+                    console.log(y);",
+        "let x = 0, y;
+                    [y = (obj[x] = (x = 1))] = [];
+                    console.log(x, y);",
+        "let x = 'used';
+                    [x] = condition ? x : x;",
     ];
 
     let fail = vec![
@@ -1838,41 +1754,6 @@ function useResource(unsafe: (resource: { readonly release: () => void }) => voi
                     [x] = x.split('/');",
         "let x = { value: 'used' };
                     ({ value: x } = x);",
-        "let x = 'used';
-                    [x = x] = [];",
-        "let x = 0;
-                    [x, x] = [1, 2];
-                    console.log(x);",
-        "let x = 0, y;
-                    [x, y = x] = [1];
-                    console.log(y);",
-        "let x = 0;
-                    [x = x] = (x = 1, []);
-                    console.log(x);",
-        "let x = 0;
-                    ({ [x]: x } = (x = 1, {}));
-                    console.log(x);",
-        "let x = 0, y;
-                    ({ [key(x)]: y } = (x = 1, {}));
-                    console.log(y);",
-        "let x = 0, y;
-                    [x, y = (x = x + 1)] = [1];
-                    console.log(x);",
-        "let x = 0;
-                    [x] = (x = x + 1, [2]);
-                    console.log(x);",
-        "let x = 0, y, z;
-                    [y = (z = x)] = (x = 1, []);
-                    console.log(y);",
-        "let x = 0, y;
-                    [x, y = ([x] = [x + 1])] = [1];
-                    console.log(x);",
-        "let x = 0, y;
-                    [y = ([x] = [x])] = (x = 1, []);
-                    console.log(x);",
-        "let x = 0, y, z;
-                    ({ [({ [x]: z } = (x = 1, {}), 0)]: y } = {});
-                    console.log(y);",
     ];
 
     Tester::new(NoUselessAssignment::NAME, NoUselessAssignment::PLUGIN, pass, fail)
