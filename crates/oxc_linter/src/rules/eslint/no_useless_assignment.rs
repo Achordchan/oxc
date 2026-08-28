@@ -136,7 +136,11 @@ struct TrackedSymbol {
 struct DestructuringAssignmentUsage {
     node_id: NodeId,
     span: Span,
+    left_span: Span,
     right_span: Span,
+    has_lhs_reference: bool,
+    has_rhs_reference: bool,
+    has_nested_destructuring_assignment: bool,
     direct_target: Option<NodeId>,
     can_defer_target: bool,
     rhs_cfg_id: Option<BlockNodeId>,
@@ -672,7 +676,11 @@ impl NoUselessAssignment {
                 usages.push(DestructuringAssignmentUsage {
                     node_id: assignment_node_id,
                     span: assignment.span,
+                    left_span: assignment.left.span(),
                     right_span: assignment.right.span(),
+                    has_lhs_reference: false,
+                    has_rhs_reference: false,
+                    has_nested_destructuring_assignment: false,
                     direct_target: None,
                     can_defer_target: true,
                     rhs_cfg_id: None,
@@ -692,6 +700,26 @@ impl NoUselessAssignment {
                 }
                 if !usage.span.contains_inclusive(reference_span) {
                     break;
+                }
+
+                usage.has_lhs_reference |= usage.left_span.contains_inclusive(reference_span);
+                usage.has_rhs_reference |= usage.right_span.contains_inclusive(reference_span);
+                if !usage.has_nested_destructuring_assignment {
+                    usage.has_nested_destructuring_assignment = ctx
+                        .nodes()
+                        .ancestors(reference.node_id())
+                        .take_while(|ancestor| ancestor.id() != usage.node_id)
+                        .any(|ancestor| {
+                            matches!(
+                                ancestor.kind(),
+                                AstKind::AssignmentExpression(assignment)
+                                    if matches!(
+                                        &assignment.left,
+                                        AstAssignmentTarget::ArrayAssignmentTarget(_)
+                                            | AstAssignmentTarget::ObjectAssignmentTarget(_)
+                                    )
+                            )
+                        });
                 }
 
                 if reference.is_write()
@@ -723,7 +751,9 @@ impl NoUselessAssignment {
             .into_iter()
             .filter_map(|usage| {
                 let Some(target_node_id) = usage.direct_target else {
-                    return Some(usage.node_id);
+                    let is_rhs_only = !usage.has_lhs_reference && usage.has_rhs_reference;
+                    return (!is_rhs_only || usage.has_nested_destructuring_assignment)
+                        .then_some(usage.node_id);
                 };
                 let target_cfg_id = ctx.nodes().cfg_id(target_node_id);
                 (!usage.can_defer_target
@@ -1805,6 +1835,11 @@ function useResource(unsafe: (resource: { readonly release: () => void }) => voi
                     ({ value: x } = x);",
         "let x = 0;
                     obj[x++] = (x = 2);
+                    console.log(x);",
+        "let x = 0;
+                    console.log(x);
+                    [y] = (x = 1, [0]);
+                    x = 2;
                     console.log(x);",
     ];
 
