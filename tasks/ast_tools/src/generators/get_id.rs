@@ -44,7 +44,7 @@ impl Generator for GetIdGenerator {
             use oxc_syntax::{node::NodeId, reference::ReferenceId, scope::ScopeId, symbol::SymbolId};
 
             ///@@line_break
-            use crate::{GetNodeId, ast::*};
+            use crate::ast::*;
 
             #(#struct_impls)*
 
@@ -140,25 +140,11 @@ fn generate_for_struct(
     }
 
     let struct_ty = struct_def.ty_anon(schema);
-    let get_node_id_impl = if struct_def.fields.iter().any(|field| field.name() == "node_id") {
-        quote! {
-            impl GetNodeId for #struct_ty {
-                #[inline]
-                fn get_node_id(&self) -> NodeId {
-                    self.node_id()
-                }
-            }
-        }
-    } else {
-        quote!()
-    };
     Some(quote! {
         ///@@line_break
         impl #struct_ty {
             #methods
         }
-
-        #get_node_id_impl
     })
 }
 
@@ -212,14 +198,6 @@ fn generate_for_enum(enum_def: &EnumDef, schema: &Schema) -> Option<TokenStream>
                 match self {
                     #(#matches),*
                 }
-            }
-        }
-
-
-        impl GetNodeId for #enum_ty {
-            #[inline]
-            fn get_node_id(&self) -> NodeId {
-                self.node_id()
             }
         }
     })

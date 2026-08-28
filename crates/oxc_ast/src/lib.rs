@@ -63,6 +63,7 @@ mod generated {
     #[cfg(feature = "serialize")]
     mod derive_estree;
     mod derive_get_address;
+    mod derive_get_node_id;
     mod derive_get_span;
     mod derive_get_span_mut;
     mod derive_replace_with;
@@ -79,11 +80,6 @@ pub use ast_kind_impl::{MemberExpressionKind, ModuleDeclarationKind};
 pub use trivia::{
     CommentsRange, comments_range, get_comment_at, has_comments_between, is_inside_comment,
 };
-
-/// Uniform access to an AST node's semantic identity.
-pub trait GetNodeId {
-    fn get_node_id(&self) -> oxc_syntax::node::NodeId;
-}
 
 // After experimenting with two types of boxed enum variants:
 //   1.
