@@ -594,9 +594,19 @@ impl NoUselessAssignment {
         }
 
         for ancestor in ctx.nodes().ancestors(node.id()) {
-            let AstKind::AssignmentExpression(assignment) = ancestor.kind() else { continue };
-            if assignment.left.span().contains_inclusive(node.span()) {
-                return Some(ancestor.id());
+            match ancestor.kind() {
+                AstKind::AssignmentExpression(_) => return Some(ancestor.id()),
+                AstKind::ArrayAssignmentTarget(_)
+                | AstKind::ObjectAssignmentTarget(_)
+                | AstKind::AssignmentTargetRest(_)
+                | AstKind::AssignmentTargetWithDefault(_)
+                | AstKind::AssignmentTargetPropertyIdentifier(_)
+                | AstKind::AssignmentTargetPropertyProperty(_)
+                | AstKind::TSAsExpression(_)
+                | AstKind::TSSatisfiesExpression(_)
+                | AstKind::TSNonNullExpression(_)
+                | AstKind::TSTypeAssertion(_) => {}
+                _ => return None,
             }
         }
 
@@ -1754,6 +1764,9 @@ function useResource(unsafe: (resource: { readonly release: () => void }) => voi
                     [x] = x.split('/');",
         "let x = { value: 'used' };
                     ({ value: x } = x);",
+        "let x = 0;
+                    obj[x++] = (x = 2);
+                    console.log(x);",
     ];
 
     Tester::new(NoUselessAssignment::NAME, NoUselessAssignment::PLUGIN, pass, fail)
