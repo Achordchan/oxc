@@ -133,6 +133,16 @@ struct TrackedSymbol {
     has_captured_read: bool,
 }
 
+struct DestructuringAssignmentUsage {
+    node_id: NodeId,
+    span: Span,
+    right_span: Span,
+    direct_target: Option<NodeId>,
+    can_defer_target: bool,
+    rhs_cfg_id: Option<BlockNodeId>,
+    rhs_crosses_cfg_blocks: bool,
+}
+
 impl Rule for NoUselessAssignment {
     fn run_once(&self, ctx: &LintContext) {
         let allocator = Allocator::default();
@@ -187,6 +197,7 @@ impl Rule for NoUselessAssignment {
                 Self::ambiguous_destructuring_assignments(ctx, symbol_id);
             let mut pending_assignment_lhs: Option<(&Reference, bool)> = None;
             let mut last_conservative_assignment = None;
+            let mut ambiguous_assignment_index = 0;
 
             for reference in ctx.symbol_references(symbol_id) {
                 let mut is_within_pending_assignment = false;
@@ -219,14 +230,21 @@ impl Rule for NoUselessAssignment {
                 }
 
                 let reference_span = ctx.nodes().get_node(reference.node_id()).span();
-                if let Some(assignment_node_id) =
-                    ambiguous_destructuring_assignments.iter().copied().find(|assignment_node_id| {
-                        ctx.nodes()
-                            .get_node(*assignment_node_id)
-                            .span()
-                            .contains_inclusive(reference_span)
-                    })
+                let mut conservative_assignment = None;
+                while let Some(&assignment_node_id) =
+                    ambiguous_destructuring_assignments.get(ambiguous_assignment_index)
                 {
+                    let assignment_span = ctx.nodes().get_node(assignment_node_id).span();
+                    if assignment_span.end < reference_span.start {
+                        ambiguous_assignment_index += 1;
+                        continue;
+                    }
+                    if assignment_span.contains_inclusive(reference_span) {
+                        conservative_assignment = Some(assignment_node_id);
+                    }
+                    break;
+                }
+                if let Some(assignment_node_id) = conservative_assignment {
                     // The exact execution order is unknown, so keep the previous value live and
                     // do not report any writes to this symbol within the assignment.
                     if last_conservative_assignment != Some(assignment_node_id) {
@@ -640,59 +658,80 @@ impl NoUselessAssignment {
         ctx: &LintContext,
         symbol_id: SymbolId,
     ) -> SmallVec<[NodeId; 1]> {
-        let mut assignments = SmallVec::<[NodeId; 1]>::new();
+        let mut usages = SmallVec::<[DestructuringAssignmentUsage; 1]>::new();
         for reference in ctx.symbol_references(symbol_id).filter(|reference| reference.is_write()) {
             if let Some(assignment_node_id) =
                 Self::get_enclosing_destructuring_assignment(ctx, reference)
-                && !assignments.contains(&assignment_node_id)
+                && usages.last().is_none_or(|usage| usage.node_id != assignment_node_id)
             {
-                assignments.push(assignment_node_id);
+                let AstKind::AssignmentExpression(assignment) =
+                    ctx.nodes().get_node(assignment_node_id).kind()
+                else {
+                    unreachable!("destructuring assignment should be an assignment expression");
+                };
+                usages.push(DestructuringAssignmentUsage {
+                    node_id: assignment_node_id,
+                    span: assignment.span,
+                    right_span: assignment.right.span(),
+                    direct_target: None,
+                    can_defer_target: true,
+                    rhs_cfg_id: None,
+                    rhs_crosses_cfg_blocks: false,
+                });
             }
         }
 
-        assignments.retain(|assignment_node_id| {
-            let AstKind::AssignmentExpression(assignment) =
-                ctx.nodes().get_node(*assignment_node_id).kind()
-            else {
-                unreachable!("destructuring assignment should be an assignment expression");
-            };
-            let mut direct_target = None;
-
-            // A single direct target whose other references are read-only and in the RHS can be
-            // modeled exactly by deferring the target write. Anything else is conservative.
-            for reference in ctx.symbol_references(symbol_id) {
-                let reference_node = ctx.nodes().get_node(reference.node_id());
-                if !assignment.span.contains_inclusive(reference_node.span()) {
+        let mut usage_index = 0;
+        for reference in ctx.symbol_references(symbol_id) {
+            let reference_node = ctx.nodes().get_node(reference.node_id());
+            let reference_span = reference_node.span();
+            while let Some(usage) = usages.get_mut(usage_index) {
+                if usage.span.end < reference_span.start {
+                    usage_index += 1;
                     continue;
+                }
+                if !usage.span.contains_inclusive(reference_span) {
+                    break;
                 }
 
                 if reference.is_write()
-                    && Self::get_assignment_node(ctx, reference) == Some(*assignment_node_id)
+                    && Self::get_assignment_node(ctx, reference) == Some(usage.node_id)
                 {
-                    if direct_target.replace(reference.node_id()).is_some() {
-                        return true;
+                    if usage.direct_target.replace(reference.node_id()).is_some() {
+                        usage.can_defer_target = false;
                     }
-                    continue;
-                }
-
-                if !reference.is_read()
+                } else if !reference.is_read()
                     || reference.is_write()
-                    || !assignment.right.span().contains_inclusive(reference_node.span())
+                    || !usage.right_span.contains_inclusive(reference_span)
                 {
-                    return true;
+                    usage.can_defer_target = false;
                 }
+
+                if usage.right_span.contains_inclusive(reference_span) {
+                    let cfg_id = ctx.nodes().cfg_id(reference.node_id());
+                    if usage.rhs_cfg_id.is_some_and(|rhs_cfg_id| rhs_cfg_id != cfg_id) {
+                        usage.rhs_crosses_cfg_blocks = true;
+                    } else {
+                        usage.rhs_cfg_id = Some(cfg_id);
+                    }
+                }
+                break;
             }
+        }
 
-            let Some(target_node_id) = direct_target else { return true };
-            let target_cfg_id = ctx.nodes().cfg_id(target_node_id);
-            ctx.symbol_references(symbol_id).any(|reference| {
-                let reference_node = ctx.nodes().get_node(reference.node_id());
-                assignment.right.span().contains_inclusive(reference_node.span())
-                    && ctx.nodes().cfg_id(reference.node_id()) != target_cfg_id
+        usages
+            .into_iter()
+            .filter_map(|usage| {
+                let Some(target_node_id) = usage.direct_target else {
+                    return Some(usage.node_id);
+                };
+                let target_cfg_id = ctx.nodes().cfg_id(target_node_id);
+                (!usage.can_defer_target
+                    || usage.rhs_crosses_cfg_blocks
+                    || usage.rhs_cfg_id.is_some_and(|rhs_cfg_id| rhs_cfg_id != target_cfg_id))
+                .then_some(usage.node_id)
             })
-        });
-
-        assignments
+            .collect()
     }
 
     fn is_in_try_block(graph: &Graph, block_node_id: BlockNodeId) -> bool {
