@@ -23,9 +23,6 @@ impl Derive for DeriveGetNodeId {
 
     fn prelude(&self) -> TokenStream {
         quote! {
-            #![expect(clippy::match_same_arms)]
-
-            ///@@line_break
             use oxc_syntax::{GetNodeId, node::NodeId};
         }
     }

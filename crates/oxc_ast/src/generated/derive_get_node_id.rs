@@ -1,8 +1,6 @@
 // Auto-generated code, DO NOT EDIT DIRECTLY!
 // To edit this generated file you have to edit `tasks/ast_tools/src/derives/get_node_id.rs`.
 
-#![expect(clippy::match_same_arms)]
-
 use oxc_syntax::{GetNodeId, node::NodeId};
 
 use crate::ast::js::*;
