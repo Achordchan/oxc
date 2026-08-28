@@ -81,9 +81,6 @@ pub use trivia::{
 };
 
 /// Uniform access to an AST node's semantic identity.
-///
-/// Returns [`oxc_syntax::node::NodeId::DUMMY`] for AST helper types without
-/// their own node identity.
 pub trait GetNodeId {
     fn get_node_id(&self) -> oxc_syntax::node::NodeId;
 }

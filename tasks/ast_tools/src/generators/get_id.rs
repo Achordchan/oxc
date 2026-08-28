@@ -140,10 +140,17 @@ fn generate_for_struct(
     }
 
     let struct_ty = struct_def.ty_anon(schema);
-    let get_node_id = if struct_def.fields.iter().any(|field| field.name() == "node_id") {
-        quote!(self.node_id())
+    let get_node_id_impl = if struct_def.fields.iter().any(|field| field.name() == "node_id") {
+        quote! {
+            impl GetNodeId for #struct_ty {
+                #[inline]
+                fn get_node_id(&self) -> NodeId {
+                    self.node_id()
+                }
+            }
+        }
     } else {
-        quote!(NodeId::DUMMY)
+        quote!()
     };
     Some(quote! {
         ///@@line_break
@@ -151,12 +158,7 @@ fn generate_for_struct(
             #methods
         }
 
-        impl GetNodeId for #struct_ty {
-            #[inline]
-            fn get_node_id(&self) -> NodeId {
-                #get_node_id
-            }
-        }
+        #get_node_id_impl
     })
 }
 
